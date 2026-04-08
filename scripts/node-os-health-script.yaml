@@ -1,0 +1,175 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: node-os-health-script
+  namespace: testkube
+data:
+  check-node-os.sh: |
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[1;33m'
+    NC='\033[0m'
+
+    FAILURES=0
+
+    fail() {
+      echo -e "${RED}FAIL:${NC} $1"
+      FAILURES=$((FAILURES+1))
+    }
+
+    pass() {
+      echo -e "${GREEN}PASS:${NC} $1"
+    }
+
+    warn() {
+      echo -e "${YELLOW}WARN:${NC} $1"
+    }
+
+    echo "========================================"
+    echo "Host identity"
+    echo "========================================"
+    chroot /host /bin/sh -c 'hostnamectl 2>/dev/null || hostname'
+    chroot /host /bin/sh -c 'cat /etc/os-release || true'
+
+    echo
+    echo "========================================"
+    echo "Filesystem usage"
+    echo "========================================"
+    while read -r fs size used avail pct mount; do
+      pct_num="${pct%\%}"
+      echo "$fs $pct $mount"
+      if [[ "$pct_num" -ge 90 ]]; then
+        fail "Filesystem $mount usage is $pct"
+      elif [[ "$pct_num" -ge 80 ]]; then
+        warn "Filesystem $mount usage is $pct"
+      else
+        pass "Filesystem $mount usage is $pct"
+      fi
+    done < <(chroot /host /bin/sh -c "df -P -x tmpfs -x devtmpfs | tail -n +2")
+
+    echo
+    echo "========================================"
+    echo "Inode usage"
+    echo "========================================"
+    while read -r fs inodes iused ifree pct mount; do
+      pct_num="${pct%\%}"
+      echo "$fs $pct $mount"
+      if [[ "$pct_num" -ge 90 ]]; then
+        fail "Inode usage on $mount is $pct"
+      elif [[ "$pct_num" -ge 80 ]]; then
+        warn "Inode usage on $mount is $pct"
+      else
+        pass "Inode usage on $mount is $pct"
+      fi
+    done < <(chroot /host /bin/sh -c "df -Pi -x tmpfs -x devtmpfs | tail -n +2")
+
+    echo
+    echo "========================================"
+    echo "Memory and swap"
+    echo "========================================"
+    mem_available_kb="$(awk '/MemAvailable/ {print $2}' /host/proc/meminfo || echo 0)"
+    swap_total_kb="$(awk '/SwapTotal/ {print $2}' /host/proc/meminfo || echo 0)"
+    if [[ "${mem_available_kb}" -le 262144 ]]; then
+      fail "Available memory is very low: ${mem_available_kb} kB"
+    else
+      pass "Available memory looks acceptable: ${mem_available_kb} kB"
+    fi
+
+    if [[ "${swap_total_kb}" -gt 0 ]]; then
+      warn "Swap appears enabled: ${swap_total_kb} kB"
+    else
+      pass "Swap appears disabled"
+    fi
+
+    echo
+    echo "========================================"
+    echo "Kubelet and runtime"
+    echo "========================================"
+    if chroot /host /bin/sh -c 'systemctl is-active kubelet >/dev/null 2>&1'; then
+      pass "kubelet is active"
+    else
+      fail "kubelet is not active"
+    fi
+
+    if [[ -S /host/run/containerd/containerd.sock ]] || [[ -S /host/var/run/containerd/containerd.sock ]]; then
+      pass "containerd socket found"
+    elif [[ -S /host/run/crio/crio.sock ]]; then
+      pass "CRI-O socket found"
+    else
+      fail "No known container runtime socket found"
+    fi
+
+    echo
+    echo "========================================"
+    echo "Failed systemd units"
+    echo "========================================"
+    failed_units="$(chroot /host /bin/sh -c 'systemctl --failed --no-legend --no-pager 2>/dev/null | wc -l' || echo 0)"
+    if [[ "${failed_units}" -gt 0 ]]; then
+      warn "There are ${failed_units} failed systemd units"
+      chroot /host /bin/sh -c 'systemctl --failed --no-pager || true'
+    else
+      pass "No failed systemd units reported"
+    fi
+
+    echo
+    echo "========================================"
+    echo "Time sync"
+    echo "========================================"
+    if chroot /host /bin/sh -c 'timedatectl status 2>/dev/null | grep -qi "synchronized: yes"'; then
+      pass "Time synchronization looks healthy"
+    else
+      warn "Could not confirm time synchronization"
+    fi
+
+    echo
+    echo "========================================"
+    echo "Recent critical logs"
+    echo "========================================"
+    if chroot /host /bin/sh -c 'journalctl -p err -b --no-pager -n 50 >/tmp/node-errors.out 2>/dev/null'; then
+      error_count="$(chroot /host /bin/sh -c 'wc -l < /tmp/node-errors.out' || echo 0)"
+      if [[ "${error_count}" -gt 0 ]]; then
+        warn "Recent boot has ${error_count} error-priority journal entries"
+        chroot /host /bin/sh -c 'cat /tmp/node-errors.out | tail -n 20'
+      else
+        pass "No recent error-priority journal entries found"
+      fi
+    else
+      warn "Could not query journalctl"
+    fi
+
+    echo
+    echo "========================================"
+    echo "Kernel log scan"
+    echo "========================================"
+    if [[ -r /host/var/log/messages ]]; then
+      if grep -Ei 'I/O error|filesystem read-only|EXT4-fs error|xfs.*Corruption|segfault|oom-killer|call trace' /host/var/log/messages >/tmp/kernel_hits.out 2>/dev/null; then
+        warn "Potential critical patterns found in /var/log/messages"
+        tail -n 20 /tmp/kernel_hits.out
+      else
+        pass "No critical kernel/system log patterns found in /var/log/messages"
+      fi
+    else
+      warn "/var/log/messages not readable; skipping"
+    fi
+
+    echo
+    echo "========================================"
+    echo "API reachability from node"
+    echo "========================================"
+    if curl -sk --max-time 10 https://kubernetes.default.svc/healthz >/dev/null; then
+      pass "Kubernetes API reachable from workflow pod"
+    else
+      fail "Kubernetes API not reachable from workflow pod"
+    fi
+
+    echo
+    if [[ "${FAILURES}" -gt 0 ]]; then
+      echo -e "${RED}Node OS health validation failed with ${FAILURES} issue(s).${NC}"
+      exit 1
+    fi
+
+    echo -e "${GREEN}Node OS health validation passed.${NC}"
+

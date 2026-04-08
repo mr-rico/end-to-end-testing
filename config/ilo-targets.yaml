@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ilo-targets
+  namespace: testkube
+data:
+  targets.txt: |
+    ilo-node-1.example.local
+    ilo-node-2.example.local
+    ilo-node-3.example.local

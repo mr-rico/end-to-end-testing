@@ -1,0 +1,67 @@
+apiVersion: testworkflows.testkube.io/v1
+kind: TestWorkflow
+metadata:
+  name: node-os-health
+  namespace: testkube
+spec:
+  description: Validate Kubernetes node operating system health from cluster and host perspectives
+  serviceAccountName: testkube-node-health
+
+  pod:
+    volumes:
+    - name: host-root
+      hostPath:
+        path: /
+    - name: script-volume
+      configMap:
+        name: node-os-health-script
+        defaultMode: 0755
+
+  container:
+    image: alpine:3.20
+    workingDir: /data
+    volumeMounts:
+    - name: host-root
+      mountPath: /host
+      readOnly: true
+    - name: script-volume
+      mountPath: /opt/scripts
+      readOnly: true
+    securityContext:
+      privileged: true
+
+  steps:
+  - name: cluster-view
+    run:
+      image: bitnami/kubectl:latest
+      shell: |
+        echo "========================================"
+        echo "Node readiness"
+        echo "========================================"
+        kubectl get nodes -o wide
+
+        not_ready="$(kubectl get nodes --no-headers | awk '$2 != "Ready" {print $1}')"
+        if [ -n "$not_ready" ]; then
+          echo "Not Ready nodes:"
+          echo "$not_ready"
+          exit 1
+        fi
+
+        echo
+        echo "========================================"
+        echo "Node conditions"
+        echo "========================================"
+        kubectl get nodes -o json | jq -r '
+          .items[] |
+          .metadata.name as $n |
+          .status.conditions[] |
+          select(.type=="MemoryPressure" or .type=="DiskPressure" or .type=="PIDPressure" or .type=="Ready") |
+          "\($n) \(.type)=\(.status)"'
+
+  - name: host-view
+    run:
+      image: alpine:3.20
+      shell: |
+        apk add --no-cache bash curl jq util-linux coreutils grep
+        /opt/scripts/check-node-os.sh
+

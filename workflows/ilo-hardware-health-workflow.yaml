@@ -1,0 +1,49 @@
+apiVersion: testworkflows.testkube.io/v1
+kind: TestWorkflow
+metadata:
+  name: ilo-hardware-health
+  namespace: testkube
+spec:
+  description: Read-only iLO Redfish hardware health validation
+  job:
+    activeDeadlineSeconds: 900
+  content:
+    files:
+    - path: /data/check-ilo.sh
+      configMap:
+        name: ilo-check-script
+        items:
+        - key: check-ilo.sh
+          path: check-ilo.sh
+    - path: /data/targets.txt
+      configMap:
+        name: ilo-targets
+        items:
+        - key: targets.txt
+          path: targets.txt
+  container:
+    image: alpine:3.20
+    workingDir: /data
+    env:
+    - name: ILO_USERNAME
+      valueFrom:
+        secretKeyRef:
+          name: ilo-credentials
+          key: ILO_USERNAME
+    - name: ILO_PASSWORD
+      valueFrom:
+        secretKeyRef:
+          name: ilo-credentials
+          key: ILO_PASSWORD
+    - name: TARGETS_FILE
+      value: /data/targets.txt
+    command:
+    - /bin/sh
+    - -c
+    args:
+    - |
+      set -e
+      apk add --no-cache bash curl jq
+      chmod +x /data/check-ilo.sh
+      /data/check-ilo.sh
+
